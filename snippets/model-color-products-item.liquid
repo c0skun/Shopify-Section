@@ -1,0 +1,47 @@
+{% doc %}
+  "Renk kartları (model)" bloğunun tek bir kartı.
+  Temanın kendi `card-product` snippet'ini kullanır; böylece kart görünümü
+  (rozetler, fiyat, swatch'lar, yıldızlar) "Related products" ile birebir aynı olur.
+
+  @param {product} item - Gösterilecek ürün
+  @param {product} current - Açık olan ürün
+  @param {object} st - Blok ayarları (block.settings)
+  @param {string} section_id - Section id
+  @param {number} index - Döngü sırası (1'den başlar)
+  @param {boolean} is_slide - Swiper slide sınıfı eklensin mi
+  @param {boolean} skip_styles - Kart CSS'i daha önce yüklendiyse true
+{% enddoc %}
+
+{%- liquid
+  assign is_current = false
+  if item.id == current.id
+    assign is_current = true
+  endif
+-%}
+
+<li
+  id="ModelColor-{{ section_id }}-{{ item.id }}-{{ index }}"
+  class="grid__item model-color-products__item{% if is_slide %} swiper-slide{% endif %}{% if is_current %} model-color-products__item--current{% endif %}{% if settings.animations_reveal_on_scroll %} scroll-trigger animate--slide-in{% endif %}"
+  {% if settings.animations_reveal_on_scroll %}
+    style="--animation-order: {{ index }};"
+  {% endif %}
+  {% if is_current %}
+    aria-current="page"
+  {% endif %}
+>
+  {%- render 'card-product',
+    card_product: item,
+    media_aspect_ratio: st.image_ratio,
+    image_shape: st.image_shape,
+    show_secondary_image: st.show_secondary_image,
+    show_vendor: st.show_vendor,
+    show_rating: st.show_rating,
+    skip_styles: skip_styles,
+    section_id: section_id,
+    quick_add: st.quick_add
+  -%}
+
+  {%- if is_current and st.current_badge_text != blank -%}
+    <span class="model-color-products__current-badge">{{ st.current_badge_text }}</span>
+  {%- endif -%}
+</li>
