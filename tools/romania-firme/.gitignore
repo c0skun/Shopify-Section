@@ -1,0 +1,4 @@
+onrc/
+cache/
+*.xlsx
+__pycache__/
