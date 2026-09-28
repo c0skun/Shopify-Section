@@ -124,21 +124,38 @@ def find_onrc_package():
     )
 
 
-def download(url, dest):
+def download(url, dest, tries=5):
     if dest.exists() and dest.stat().st_size > 0:
         log(f"  var: {dest.name}")
         return dest
-    log(f"  indiriliyor: {url}")
+    log(f"  indiriliyor: {dest.name}")
     tmp = dest.with_name(dest.name + ".part")
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-    tmp.replace(dest)
-    return dest
+    for attempt in range(1, tries + 1):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                done, last, start = 0, 0.0, time.time()
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if time.time() - last > 5:
+                        last = time.time()
+                        speed = done / max(last - start, 1) / 1e6
+                        pct = f" (%{done * 100 / total:.0f})" if total else ""
+                        print(f"\r    {done / 1e6:,.0f} MB{pct}  {speed:.1f} MB/sn   ",
+                              end="", flush=True)
+            print(f"\r    {done / 1e6:,.0f} MB tamam{' ' * 20}", flush=True)
+            tmp.replace(dest)
+            return dest
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            print()
+            log(f"    indirme hatasi ({e.__class__.__name__}), tekrar deneniyor ({attempt}/{tries})")
+            time.sleep(10 * attempt)
+    raise SystemExit(f"{dest.name} indirilemedi. Tarayicidan indirip {dest.parent} klasorune koyun:\n{url}")
 
 
 def fetch_onrc(onrc_dir):
