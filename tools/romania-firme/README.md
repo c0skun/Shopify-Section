@@ -51,6 +51,9 @@ python firme_5621.py
 
 ## Sorun çıkarsa
 
+- **"An Application Control policy has blocked this file":** Bu Windows Smart App Control
+  uyarısıdır. Script artık pandas gibi derlenmiş paket kullanmıyor, sadece `openpyxl`
+  gerekiyor (saf Python).
 - **"ONRC seti bulunamadı":** https://data.gov.ro/dataset?q=firme+inregistrate+registrul+comertului
   adresinden en güncel seti açın, `od_firme`, `od_caen_autorizat`, `od_stare_firma` ve
   `n_stare_firma` dosyalarını `onrc/` klasörüne indirip tekrar çalıştırın.

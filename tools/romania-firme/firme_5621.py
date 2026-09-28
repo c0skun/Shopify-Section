@@ -10,6 +10,9 @@ Kaynaklar:
                     calisan sayisi (bilancodaki ana faaliyet kodu)
   3. ANAF TVA API - webservicesp.anaf.ro/api/PlatitorTvaRest -> adres, telefon, durum
 
+Sadece Python standart kutuphanesi + openpyxl kullanir (derlenmis DLL yok,
+Windows Smart App Control engellemez).
+
 Kullanim:
   pip install -r requirements.txt
   python firme_5621.py                   # hepsini indirir ve calistirir
@@ -21,16 +24,15 @@ cache/ klasorunde saklanir, kaldigi yerden devam eder.
 import argparse
 import csv
 import datetime as dt
-import io
 import json
 import re
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-
-import pandas as pd
-import requests
 
 CKAN = "https://data.gov.ro/api/3/action"
 ANAF_BILANT = "https://webservicesp.anaf.ro/bilant"
@@ -38,6 +40,7 @@ ANAF_TVA = "https://webservicesp.anaf.ro/api/PlatitorTvaRest/v9/tva"
 UA = {"User-Agent": "Mozilla/5.0 (firme-5621 open-data script)"}
 
 HERE = Path(__file__).resolve().parent
+csv.field_size_limit(10 * 1024 * 1024)
 
 
 def log(msg):
@@ -56,19 +59,62 @@ def clean_cui(v):
 
 
 # --------------------------------------------------------------------------
+# HTTP (urllib, ek paket gerektirmez)
+# --------------------------------------------------------------------------
+
+class HttpResult:
+    def __init__(self, status, body):
+        self.status_code, self.body = status, body
+
+    def json(self):
+        return json.loads(self.body.decode("utf-8"))
+
+
+def http(method, url, params=None, body=None, timeout=60):
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = dict(UA)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return HttpResult(r.status, r.read())
+    except urllib.error.HTTPError as e:
+        return HttpResult(e.code, e.read() or b"")
+
+
+def http_retry(fn, tries=6):
+    delay = 5
+    for _ in range(tries):
+        try:
+            r = fn()
+            if r.status_code == 200:
+                return r
+            if r.status_code == 404:
+                return None
+            log(f"    HTTP {r.status_code}, {delay}s bekleniyor")
+        except (urllib.error.URLError, OSError, TimeoutError) as e:
+            log(f"    ag hatasi ({e.__class__.__name__}), {delay}s bekleniyor")
+        time.sleep(delay)
+        delay = min(delay * 2, 300)
+    return None
+
+
+# --------------------------------------------------------------------------
 # 1. ONRC dosyalari (data.gov.ro)
 # --------------------------------------------------------------------------
 
 def find_onrc_package():
     """En guncel ONRC firma setini CKAN API ile bulur."""
-    r = requests.get(
-        f"{CKAN}/package_search",
-        params={"q": "firme registrul comertului", "rows": 50, "sort": "metadata_modified desc"},
-        headers=UA, timeout=60,
-    )
-    r.raise_for_status()
+    r = http_retry(lambda: http("GET", f"{CKAN}/package_search", params={
+        "q": "firme registrul comertului", "rows": 50, "sort": "metadata_modified desc"}))
+    if r is None:
+        raise SystemExit("data.gov.ro API'sine ulasilamadi.")
     for pkg in r.json()["result"]["results"]:
-        names = " ".join(norm(res.get("name") or res.get("url", "")) + " " + norm(res.get("url", ""))
+        names = " ".join(norm(res.get("name") or "") + " " + norm(res.get("url", ""))
                          for res in pkg["resources"])
         if "od_firme" in names and "caen" in names:
             return pkg
@@ -83,13 +129,15 @@ def download(url, dest):
         log(f"  var: {dest.name}")
         return dest
     log(f"  indiriliyor: {url}")
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    with requests.get(url, headers=UA, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
-    tmp.rename(dest)
+    tmp = dest.with_name(dest.name + ".part")
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+    tmp.replace(dest)
     return dest
 
 
@@ -100,47 +148,52 @@ def fetch_onrc(onrc_dir):
     wanted = ("od_firme", "od_caen_autorizat", "od_stare_firma", "n_stare_firma")
     for res in pkg["resources"]:
         url = res.get("url", "")
-        fname = url.rsplit("/", 1)[-1] or (res.get("name") or "")
+        fname = urllib.parse.unquote(url.rsplit("/", 1)[-1]) or (res.get("name") or "")
         if any(w in norm(fname) for w in wanted):
             download(url, onrc_dir / fname)
 
 
 def pick_file(onrc_dir, key):
-    files = sorted(p for p in onrc_dir.iterdir()
-                   if key in norm(p.name) and not p.name.endswith(".part"))
-    return files
+    if not onrc_dir.exists():
+        return []
+    return sorted(p for p in onrc_dir.iterdir()
+                  if key in norm(p.name) and not p.name.endswith(".part"))
 
 
 def sniff(path):
     """Ayraci ve kodlamayi tahmin eder (ONRC genelde '^' kullanir)."""
-    raw = path.open("rb").read(64 * 1024)
+    with path.open("rb") as f:
+        raw = f.read(64 * 1024)
     enc = "utf-8-sig"
     try:
         head = raw.decode(enc)
     except UnicodeDecodeError:
-        enc, head = "cp1250", raw.decode("cp1250", "replace")
+        # sadece son karakter kesilmis olabilir
+        try:
+            head = raw[:-4].decode(enc)
+        except UnicodeDecodeError:
+            enc, head = "cp1250", raw.decode("cp1250", "replace")
     first = head.splitlines()[0]
     sep = max(["^", ";", "|", "\t", ","], key=first.count)
     return sep, enc
 
 
 def read_table(path, want):
-    """want: {hedef_ad: [olasi kolon adlari / parcalari]} -> DataFrame."""
+    """want: {hedef_ad: [olasi kolon adlari / parcalari]} -> satir dict'leri (generator)."""
     sep, enc = sniff(path)
-    cols = pd.read_csv(path, sep=sep, encoding=enc, nrows=0, dtype=str,
-                       engine="python" if len(sep) > 1 else "c").columns
-    ncols = {c: norm(c).replace(" ", "_") for c in cols}
-    mapping = {}
-    for target, options in want.items():
-        for opt in options:
-            hit = [c for c, n in ncols.items() if n == opt] or \
-                  [c for c, n in ncols.items() if opt in n]
-            if hit:
-                mapping[hit[0]] = target
-                break
-    df = pd.read_csv(path, sep=sep, encoding=enc, usecols=list(mapping), dtype=str,
-                     quoting=csv.QUOTE_NONE, on_bad_lines="skip")
-    return df.rename(columns=mapping)
+    with path.open(encoding=enc, errors="replace", newline="") as f:
+        reader = csv.reader(f, delimiter=sep, quoting=csv.QUOTE_NONE)
+        header = [norm(c).replace(" ", "_") for c in next(reader)]
+        idx = {}
+        for target, options in want.items():
+            for opt in options:
+                hit = [i for i, n in enumerate(header) if n == opt] or \
+                      [i for i, n in enumerate(header) if opt in n]
+                if hit:
+                    idx[target] = hit[0]
+                    break
+        for row in reader:
+            yield {t: (row[i].strip() if i < len(row) else "") for t, i in idx.items()}
 
 
 def onrc_candidates(onrc_dir, caen):
@@ -150,38 +203,45 @@ def onrc_candidates(onrc_dir, caen):
         raise SystemExit(f"{onrc_dir} icinde od_firme / od_caen_autorizat dosyalari yok.")
 
     log("ONRC CAEN dosyasi okunuyor...")
-    ca = pd.concat(read_table(f, {"reg": ["cod_inmatriculare"],
-                                  "caen": ["cod_caen_autorizat", "cod_caen", "caen"]})
-                   for f in caen_files)
-    ca["caen"] = ca["caen"].str.strip().str.zfill(4)
-    regs = set(ca.loc[ca["caen"] == caen, "reg"].str.strip())
+    regs = set()
+    for f in caen_files:
+        for r in read_table(f, {"reg": ["cod_inmatriculare"],
+                                "caen": ["cod_caen_autorizat", "cod_caen", "caen"]}):
+            if r.get("caen", "").zfill(4) == caen:
+                regs.add(r["reg"])
     log(f"  CAEN {caen} icin yetkili firma: {len(regs):,}")
 
-    log("ONRC firma dosyasi okunuyor (buyuk dosya, 1-2 dk surebilir)...")
-    fi = pd.concat(read_table(f, {
-        "reg": ["cod_inmatriculare"], "cui": ["cui", "cod_fiscal"],
-        "denumire": ["denumire"], "forma": ["forma_juridica"],
-        "judet": ["adr_judet", "judet"], "localitate": ["adr_localitate", "localitate"],
-        "data_inm": ["data_inmatriculare"],
-    }) for f in firme_files)
-    fi["reg"] = fi["reg"].str.strip()
-    fi = fi[fi["reg"].isin(regs)].copy()
-
-    # Silinmis (radiata) firmalari ele
+    dead_regs = set()
     st_files, nst_files = pick_file(onrc_dir, "od_stare_firma"), pick_file(onrc_dir, "n_stare_firma")
     if st_files and nst_files:
-        st = pd.concat(read_table(f, {"reg": ["cod_inmatriculare"], "cod": ["cod"]}) for f in st_files)
-        nst = pd.concat(read_table(f, {"cod": ["cod"], "den": ["denumire"]}) for f in nst_files)
-        dead = set(nst.loc[nst["den"].map(norm).str.contains("radiat|radiere"), "cod"].str.strip())
-        dead_regs = set(st.loc[st["cod"].str.strip().isin(dead), "reg"].str.strip())
-        before = len(fi)
-        fi = fi[~fi["reg"].isin(dead_regs)]
-        log(f"  silinmis firmalar cikarildi: {before - len(fi):,}")
+        dead = set()
+        for f in nst_files:
+            for r in read_table(f, {"cod": ["cod"], "den": ["denumire"]}):
+                if re.search("radiat|radiere", norm(r.get("den", ""))):
+                    dead.add(r["cod"])
+        for f in st_files:
+            for r in read_table(f, {"reg": ["cod_inmatriculare"], "cod": ["cod"]}):
+                if r.get("cod") in dead and r.get("reg") in regs:
+                    dead_regs.add(r["reg"])
+        log(f"  silinmis firmalar cikarilacak: {len(dead_regs):,}")
 
-    fi["cui"] = fi["cui"].map(clean_cui)
-    fi = fi.dropna(subset=["cui"]).drop_duplicates("cui")
-    log(f"  aday firma: {len(fi):,}")
-    return fi
+    log("ONRC firma dosyasi okunuyor (buyuk dosya, birkac dk surebilir)...")
+    firms = {}
+    for f in firme_files:
+        for r in read_table(f, {
+            "reg": ["cod_inmatriculare"], "cui": ["cui", "cod_fiscal"],
+            "denumire": ["denumire"], "forma": ["forma_juridica"],
+            "judet": ["adr_judet", "judet"], "localitate": ["adr_localitate", "localitate"],
+            "data_inm": ["data_inmatriculare"],
+        }):
+            if r.get("reg") not in regs or r["reg"] in dead_regs:
+                continue
+            cui = clean_cui(r.get("cui"))
+            if cui and cui not in firms:
+                r["cui"] = cui
+                firms[cui] = r
+    log(f"  aday firma: {len(firms):,}")
+    return list(firms.values())
 
 
 # --------------------------------------------------------------------------
@@ -190,14 +250,15 @@ def onrc_candidates(onrc_dir, caen):
 
 class Cache:
     def __init__(self, path):
-        self.path, self.data = path, {}
+        self.data = {}
         if path.exists():
-            for line in path.open(encoding="utf-8"):
-                try:
-                    k, v = json.loads(line)
-                    self.data[k] = v
-                except ValueError:
-                    pass
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        k, v = json.loads(line)
+                        self.data[k] = v
+                    except ValueError:
+                        pass
         self.f = path.open("a", encoding="utf-8")
 
     def __contains__(self, k):
@@ -212,23 +273,6 @@ class Cache:
         self.f.flush()
 
 
-def http_retry(fn, tries=6):
-    delay = 5
-    for i in range(tries):
-        try:
-            r = fn()
-            if r.status_code == 200:
-                return r
-            if r.status_code == 404:
-                return None
-            log(f"    HTTP {r.status_code}, {delay}s bekleniyor")
-        except requests.RequestException as e:
-            log(f"    ag hatasi ({e.__class__.__name__}), {delay}s bekleniyor")
-        time.sleep(delay)
-        delay = min(delay * 2, 300)
-    return None
-
-
 def anaf_tva(cuis, cache, pause):
     today = dt.date.today().isoformat()
     todo = [c for c in cuis if c not in cache]
@@ -236,13 +280,13 @@ def anaf_tva(cuis, cache, pause):
     for i in range(0, len(todo), 100):
         batch = todo[i:i + 100]
         body = [{"cui": int(c), "data": today} for c in batch]
-        r = http_retry(lambda: requests.post(ANAF_TVA, json=body, headers=UA, timeout=60))
+        r = http_retry(lambda: http("POST", ANAF_TVA, body=body))
         found = {}
         if r is not None:
             try:
                 for item in r.json().get("found", []):
                     found[str(item["date_generale"]["cui"])] = item
-            except ValueError:
+            except (ValueError, KeyError, TypeError):
                 pass
         for c in batch:
             cache.put(c, found.get(c))
@@ -257,8 +301,7 @@ def anaf_bilant(cuis, years, cache, pause):
     for n, c in enumerate(todo, 1):
         result = None
         for y in years:
-            r = http_retry(lambda: requests.get(ANAF_BILANT, params={"an": y, "cui": c},
-                                                headers=UA, timeout=60))
+            r = http_retry(lambda: http("GET", ANAF_BILANT, params={"an": y, "cui": c}))
             time.sleep(pause)
             if r is None:
                 continue
@@ -282,9 +325,23 @@ def indicator(bil, *names):
     return None
 
 
+def to_num(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 # --------------------------------------------------------------------------
-# 4. Excel
+# 4. Excel (openpyxl, saf Python)
 # --------------------------------------------------------------------------
+
+COLUMNS = ["Denumire", "CUI", "Nr. Reg. Com.", "Judet", "Localitate", "Adresa", "Telefon",
+           "CAEN preponderent", "Activitate", "An bilant", "Cifra de afaceri (RON)",
+           "Profit net (RON)", "Nr. mediu salariati", "Forma juridica", "Data inmatriculare",
+           "Stare ANAF"]
+MONEY = {"Cifra de afaceri (RON)", "Profit net (RON)"}
+
 
 def sheet_name(s, used):
     s = re.sub(r"[\[\]:*?/\\]", " ", str(s or "Necunoscut")).strip()[:31] or "Necunoscut"
@@ -296,28 +353,35 @@ def sheet_name(s, used):
     return s
 
 
-def write_excel(df, out, group_col):
+def write_excel(rows, out, group_col):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    money = {"Cifra de afaceri (RON)", "Profit net (RON)"}
-    with pd.ExcelWriter(out, engine="openpyxl") as xw:
-        used = set()
-        sheets = [("TOATE", df)] + [
-            (g, part) for g, part in sorted(df.groupby(group_col, dropna=False),
-                                            key=lambda kv: str(kv[0]))
-        ]
-        for name, part in sheets:
-            sn = sheet_name(name, used)
-            part.to_excel(xw, sheet_name=sn, index=False)
-            ws = xw.sheets[sn]
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
-            for i, col in enumerate(part.columns, 1):
-                width = max([len(str(col))] + [len(str(v)) for v in part[col].head(500)])
-                ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 60)
-                if col in money:
-                    for cell in ws[get_column_letter(i)][1:]:
-                        cell.number_format = "#,##0"
+    groups = {}
+    for r in rows:
+        groups.setdefault(r[group_col] or "Necunoscut", []).append(r)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    used = set()
+    for name, part in [("TOATE", rows)] + sorted(groups.items(), key=lambda kv: norm(kv[0])):
+        ws = wb.create_sheet(sheet_name(name, used))
+        ws.append(COLUMNS)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+        for r in part:
+            ws.append([r.get(col) for col in COLUMNS])
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for i, col in enumerate(COLUMNS, 1):
+            letter = get_column_letter(i)
+            width = max([len(col)] + [len(str(r.get(col) or "")) for r in part[:500]])
+            ws.column_dimensions[letter].width = min(max(width + 2, 8), 60)
+            if col in MONEY:
+                for cell in ws[letter][1:]:
+                    cell.number_format = "#,##0"
+    wb.save(out)
 
 
 # --------------------------------------------------------------------------
@@ -333,7 +397,7 @@ def main():
                     help="Excel'de sayfa bolme: judet (il) veya localitate (sehir/kasaba)")
     ap.add_argument("--pause", type=float, default=1.0, help="ANAF istekleri arasi bekleme (sn)")
     ap.add_argument("--include-other-main-caen", action="store_true",
-                    help="Bilancoda ana faaliyeti 5621 olmayanlari da ekle (ayri sutunla)")
+                    help="Bilancoda ana faaliyeti 5621 olmayanlari da ekle")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -341,12 +405,12 @@ def main():
     years = [int(y) for y in args.years.split(",")] if args.years else [this_year - 1, this_year - 2]
     caen = args.caen.zfill(4)
 
-    if not args.onrc_dir.exists() or not pick_file(args.onrc_dir, "od_firme"):
+    if not pick_file(args.onrc_dir, "od_firme"):
         log("ONRC dosyalari data.gov.ro'dan indiriliyor...")
         fetch_onrc(args.onrc_dir)
 
-    fi = onrc_candidates(args.onrc_dir, caen)
-    cuis = fi["cui"].tolist()
+    firms = onrc_candidates(args.onrc_dir, caen)
+    cuis = [f["cui"] for f in firms]
 
     cache_dir = HERE / "cache"
     cache_dir.mkdir(exist_ok=True)
@@ -357,20 +421,22 @@ def main():
     anaf_bilant(cuis, years, bil, args.pause)
 
     rows = []
-    for rec in fi.to_dict("records"):
+    for rec in firms:
         c = rec["cui"]
         b = bil.get(c) or {}
         t = tva.get(c) or {}
-        g = t.get("date_generale", {}) if t else {}
-        sed = t.get("adresa_sediu_social", {}) if t else {}
+        g = t.get("date_generale") or {}
+        sed = t.get("adresa_sediu_social") or {}
         raw_caen = str(b.get("caen") or g.get("cod_CAEN") or "").strip()
         main_caen = raw_caen.zfill(4) if raw_caen else ""
         if main_caen != caen and not args.include_other_main_caen:
             continue
-        ciro = indicator(b, "cifra de afaceri")
-        profit = indicator(b, "profit net", "profitul net")
-        loss = indicator(b, "pierdere neta", "pierderea neta")
-        if profit in (None, 0) and loss:
+        stare = g.get("stare_inregistrare") or ""
+        if re.search("radiere|radiat", norm(stare)):
+            continue
+        profit = to_num(indicator(b, "profit net", "profitul net"))
+        loss = to_num(indicator(b, "pierdere neta", "pierderea neta"))
+        if not profit and loss:
             profit = -abs(loss)
         rows.append({
             "Denumire": rec.get("denumire") or g.get("denumire"),
@@ -383,25 +449,22 @@ def main():
             "CAEN preponderent": main_caen,
             "Activitate": b.get("den_caen"),
             "An bilant": b.get("an"),
-            "Cifra de afaceri (RON)": ciro,
+            "Cifra de afaceri (RON)": to_num(indicator(b, "cifra de afaceri")),
             "Profit net (RON)": profit,
-            "Nr. mediu salariati": indicator(b, "numar mediu de salariati", "numarul mediu de salariati"),
+            "Nr. mediu salariati": to_num(indicator(b, "numar mediu de salariati", "numarul mediu de salariati")),
             "Forma juridica": rec.get("forma"),
             "Data inmatriculare": rec.get("data_inm"),
-            "Stare ANAF": g.get("stare_inregistrare"),
+            "Stare ANAF": stare,
         })
 
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not rows:
         raise SystemExit("Filtreye uyan firma bulunamadi.")
-    df = df[~df["Stare ANAF"].fillna("").map(norm).str.contains("radiere|radiat")]
-    df["Cifra de afaceri (RON)"] = pd.to_numeric(df["Cifra de afaceri (RON)"], errors="coerce")
-    df = df.sort_values("Cifra de afaceri (RON)", ascending=False, na_position="last")
+    rows.sort(key=lambda r: (r["Cifra de afaceri (RON)"] is None, -(r["Cifra de afaceri (RON)"] or 0)))
 
     group_col = "Judet" if args.group == "judet" else "Localitate"
     out = args.out or HERE / f"firme_caen_{caen}_{dt.date.today():%Y%m%d}.xlsx"
-    write_excel(df, out, group_col)
-    log(f"Bitti: {len(df):,} firma -> {out}")
+    write_excel(rows, out, group_col)
+    log(f"Bitti: {len(rows):,} firma -> {out}")
 
 
 if __name__ == "__main__":
